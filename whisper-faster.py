@@ -8,7 +8,7 @@ import logging
 from datetime import datetime, timedelta
 import torch
 from tqdm import tqdm
-from faster_whisper import WhisperModel
+from faster_whisper import WhisperModel, BatchedInferencePipeline
 import pysubs2
 
 
@@ -66,31 +66,39 @@ def get_media_duration(media_path, logger):
         return None
 
 
-def run_whisper_faster(audio_path, output_dir, model_name, language=None, output_format="txt", verbose=False, beam_size=5, use_vad=False, logger=None):
+def run_whisper_faster(audio_path, output_dir, model_name, language=None, output_format="txt", verbose=False, beam_size=5, use_vad=False, logger=None, batch_size=16):
     """Run whisper using faster-whisper library"""
     # Load the model
-    model = WhisperModel(model_name)
+    if torch.cuda.is_available():
+        model = WhisperModel(model_name, device="cuda", compute_type="int8")
+    else:
+        model = WhisperModel(model_name)
+
+    is_batched = False
+    if is_batched:
+        model = BatchedInferencePipeline(model)
 
     # Set up parameters for transcription
     vad_filter = use_vad
-    vad_parameters = dict(min_silence_duration_ms=1000) if use_vad else None
+    vad_parameters = dict(
+        min_silence_duration_ms=500
+    ) if use_vad else None
 
     # Run transcription
-    if beam_size <= 0:
-        # Use greedy decoding if beam_size is not positive
+    if vad_filter:
         segments, info = model.transcribe(
             audio=audio_path,
+            beam_size=beam_size if beam_size > 0 else None,
             language=language,
             vad_filter=vad_filter,
-            vad_parameters=vad_parameters
+            vad_parameters=vad_parameters,
+            # batch_size=batch_size,
         )
     else:
         segments, info = model.transcribe(
             audio=audio_path,
-            beam_size=beam_size,
             language=language,
-            vad_filter=vad_filter,
-            vad_parameters=vad_parameters
+            # batch_size=batch_size,
         )
 
     # Process the segments
@@ -104,9 +112,6 @@ def run_whisper_faster(audio_path, output_dir, model_name, language=None, output
             results.append(segment_dict)
             segment_duration = s.end - s.start
             pbar.update(segment_duration)
-
-    if language is None:
-        logger.info(f"  Detected language: {info.language}")
 
     # Create subtitles based on requested format
     subs = pysubs2.load_from_whisper(results)
@@ -170,8 +175,10 @@ def main():
                         help="Whisper model to use (default: large-v3-turbo)")
     parser.add_argument("--beam-size", type=int, default=5,
                         help="Beam size for faster-whisper (default: 5, set to 0 for greedy decoding)")
-    parser.add_argument("--vad", action="store_true",
+    parser.add_argument("--vad", action="store_true", default=False,
                         help="Use Voice Activity Detection to filter out silence")
+    parser.add_argument("--batch-size", type=int, default=16,
+                        help="Batch size for inference pipeline (default: 16)")
     args = parser.parse_args()
 
     # Traverse folder for supported media files
@@ -194,6 +201,7 @@ def main():
     logger.info(f"Using model: {args.model}")
     logger.info(f"Beam size: {args.beam_size}")
     logger.info(f"VAD filter: {'Enabled' if args.vad else 'Disabled'}")
+    logger.info(f"Batch size: {args.batch_size}")
 
     audio_formats = ['.mp3', '.wav', '.ogg', '.flac', '.m4a']
 
@@ -251,7 +259,8 @@ def main():
                     verbose=False,
                     beam_size=args.beam_size,
                     use_vad=args.vad,
-                    logger=logger
+                    logger=logger,
+                    batch_size=args.batch_size
                 )
 
                 # If using auto-detect, log detected language
@@ -290,7 +299,8 @@ def main():
                             "txt",
                             verbose=False,
                             beam_size=args.beam_size,
-                            use_vad=args.vad
+                            use_vad=args.vad,
+                            batch_size=args.batch_size
                         )
                         if "txt" in output_files:
                             shutil.copy2(output_files["txt"], os.path.join(
