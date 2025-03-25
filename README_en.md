@@ -18,10 +18,10 @@ To speed up pre-exam review, I developed a tool to quickly convert video/audio i
 
 2. Run the command:
 ```bash
-python whisper-v3.py [path to video folder] [options]
+python whisper-cli.py [path to video folder] [options]
 
 # Example - Generate transcript and subtitles
-python whisper-v3.py ./lectures -l english -s
+python whisper-cli.py ./lectures -l english -s
 ```
 
 ## Use Cases

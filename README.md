@@ -18,10 +18,10 @@
 
 2. 运行命令：
 ```bash
-python whisper-v3.py [视频文件夹路径] [选项]
+python whisper-cli.py [视频文件夹路径] [选项]
 
 # 示例 - 生成文字稿和字幕
-python whisper-v3.py ./lectures -l chinese -s
+python whisper-cli.py ./lectures -l chinese -s
 ```
 
 ## 使用场景

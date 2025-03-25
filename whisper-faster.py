@@ -6,6 +6,10 @@ import shutil
 import time
 import logging
 from datetime import datetime, timedelta
+import torch
+from tqdm import tqdm
+from faster_whisper import WhisperModel
+import pysubs2
 
 
 def setup_logger():
@@ -62,24 +66,71 @@ def get_media_duration(media_path, logger):
         return None
 
 
-def run_whisper(audio_path, output_dir, model, language=None, output_format="txt", verbose=False):
-    """Run whisper command with the given parameters and return the process result"""
-    whisper_cmd = [
-        'whisper', audio_path,
-        '--model', model,
-        '--output_dir', output_dir,
-        '--output_format', output_format,
-        '--verbose', str(verbose)
-    ]
-    if language:
-        whisper_cmd.extend(['--language', language])
-    return subprocess.run(
-        whisper_cmd,
-        check=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True
-    )
+def run_whisper_faster(audio_path, output_dir, model_name, language=None, output_format="txt", verbose=False, beam_size=5, use_vad=False, logger=None):
+    """Run whisper using faster-whisper library"""
+    # Load the model
+    model = WhisperModel(model_name)
+
+    # Set up parameters for transcription
+    vad_filter = use_vad
+    vad_parameters = dict(min_silence_duration_ms=1000) if use_vad else None
+
+    # Run transcription
+    if beam_size <= 0:
+        # Use greedy decoding if beam_size is not positive
+        segments, info = model.transcribe(
+            audio=audio_path,
+            language=language,
+            vad_filter=vad_filter,
+            vad_parameters=vad_parameters
+        )
+    else:
+        segments, info = model.transcribe(
+            audio=audio_path,
+            beam_size=beam_size,
+            language=language,
+            vad_filter=vad_filter,
+            vad_parameters=vad_parameters
+        )
+
+    # Process the segments
+    # Same precision as the Whisper timestamps
+    total_duration = round(info.duration, 2)
+    results = []
+
+    with tqdm(total=total_duration, unit=" seconds") as pbar:
+        for s in segments:
+            segment_dict = {'start': s.start, 'end': s.end, 'text': s.text}
+            results.append(segment_dict)
+            segment_duration = s.end - s.start
+            pbar.update(segment_duration)
+
+    if language is None:
+        logger.info(f"  Detected language: {info.language}")
+
+    # Create subtitles based on requested format
+    subs = pysubs2.load_from_whisper(results)
+
+    # Save the files
+    base_name = os.path.basename(audio_path)
+    base_name_without_ext = os.path.splitext(base_name)[0]
+
+    output_files = {}
+
+    if output_format in ["txt", "all"]:
+        txt_path = os.path.join(output_dir, f"{base_name_without_ext}.txt")
+        with open(txt_path, "w", encoding="utf-8") as f:
+            for segment in results:
+                f.write(f"{segment['text']}\n")
+        output_files["txt"] = txt_path
+
+    if output_format in ["srt", "all"]:
+        srt_path = os.path.join(output_dir, f"{base_name_without_ext}.srt")
+        subs.save(srt_path)
+        output_files["srt"] = srt_path
+
+    # Return detected language and output files
+    return info.language, output_files
 
 
 def copy_output_file(temp_dir, temp_basename, dest_dir, dest_basename, ext, logger):
@@ -117,6 +168,10 @@ def main():
                         help="Comma-separated list of file extensions to process (default: common video/audio formats)")
     parser.add_argument("--model", default="large-v3-turbo",
                         help="Whisper model to use (default: large-v3-turbo)")
+    parser.add_argument("--beam-size", type=int, default=5,
+                        help="Beam size for faster-whisper (default: 5, set to 0 for greedy decoding)")
+    parser.add_argument("--vad", action="store_true",
+                        help="Use Voice Activity Detection to filter out silence")
     args = parser.parse_args()
 
     # Traverse folder for supported media files
@@ -137,6 +192,8 @@ def main():
         language_mode = "Automatic language detection"
     logger.info(f"Language mode: {language_mode}")
     logger.info(f"Using model: {args.model}")
+    logger.info(f"Beam size: {args.beam_size}")
+    logger.info(f"VAD filter: {'Enabled' if args.vad else 'Disabled'}")
 
     audio_formats = ['.mp3', '.wav', '.ogg', '.flac', '.m4a']
 
@@ -179,55 +236,70 @@ def main():
                         f"  Error extracting audio from {media_file}: {e}")
                     continue
 
-            # Process the audio with whisper
+            # Process the audio with faster-whisper
             logger.info(f"  Transcribing audio...")
             output_format = "all" if args.subtitles else "txt"
             audio_basename = os.path.splitext(os.path.basename(audio_path))[0]
             try:
-                # Run whisper command
-                result = run_whisper(
+                # Run whisper with faster-whisper
+                detected_language, output_files = run_whisper_faster(
                     audio_path,
                     temp_output_dir,
                     args.model,
                     args.language,
-                    output_format
+                    output_format,
+                    verbose=False,
+                    beam_size=args.beam_size,
+                    use_vad=args.vad,
+                    logger=logger
                 )
 
                 # If using auto-detect, log detected language
-                if not args.language:
-                    for line in result.stdout.splitlines():
-                        if "Detected language:" in line:
-                            logger.info(f"  {line.strip()}")
-                            break
+                if not args.language and detected_language:
+                    logger.info(f"  Detected language: {detected_language}")
 
-                # Copy output files to destination
-                copy_output_file(temp_output_dir, audio_basename,
-                                 input_folder, base_name, ".txt", logger)
+                # Copy text file to destination
+                if "txt" in output_files:
+                    shutil.copy2(output_files["txt"], os.path.join(
+                        input_folder, f"{base_name}.txt"))
+                    logger.info(
+                        f"  TXT file saved to {os.path.join(input_folder, f'{base_name}.txt')}")
 
                 # Copy SRT file if needed
-                if args.subtitles and not copy_output_file(temp_output_dir, audio_basename, input_folder, base_name, ".srt", logger):
-                    logger.warning(
-                        f"  WARNING: SRT file was not generated by whisper")
+                if args.subtitles and "srt" in output_files:
+                    shutil.copy2(output_files["srt"], os.path.join(
+                        input_folder, f"{base_name}.srt"))
+                    logger.info(
+                        f"  SRT file saved to {os.path.join(input_folder, f'{base_name}.srt')}")
+                elif args.subtitles:
+                    logger.warning(f"  WARNING: SRT file was not generated")
 
-            except subprocess.CalledProcessError as e:
+            except Exception as e:
                 logger.error(f"  Error processing {media_file}:")
-                logger.error(f"  Error output: {e.stderr}")
+                logger.error(f"  Error output: {str(e)}")
 
                 # Try again with txt format only if 'all' failed
                 if args.subtitles and output_format == "all":
                     logger.info(f"  Retrying with txt format only...")
                     try:
-                        run_whisper(audio_path, temp_output_dir,
-                                    args.model, args.language, "txt")
-                        copy_output_file(
-                            temp_output_dir, audio_basename, input_folder, base_name, ".txt", logger)
-                    except subprocess.CalledProcessError as e2:
+                        detected_language, output_files = run_whisper_faster(
+                            audio_path,
+                            temp_output_dir,
+                            args.model,
+                            args.language,
+                            "txt",
+                            verbose=False,
+                            beam_size=args.beam_size,
+                            use_vad=args.vad
+                        )
+                        if "txt" in output_files:
+                            shutil.copy2(output_files["txt"], os.path.join(
+                                input_folder, f"{base_name}.txt"))
+                            logger.info(
+                                f"  TXT file saved to {os.path.join(input_folder, f'{base_name}.txt')}")
+                    except Exception as e2:
                         logger.error(
                             f"  Failed to process file even with txt format only: {e2}")
-
-            except Exception as e:
-                logger.error(
-                    f"  Unexpected error processing {media_file}: {e}")
 
         # End timing and report
         end_time = time.time()
