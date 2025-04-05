@@ -5,6 +5,7 @@ import os
 from tqdm import tqdm
 import yaml
 import math
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Custom exceptions
 
@@ -32,22 +33,12 @@ MODEL = load_config()["model"]
 
 
 def extract_partial_translations(response_text: str) -> list[str]:
-    """
-    Extract as many valid translations as possible from a potentially invalid YAML response.
-
-    Args:
-        response_text: The raw response text from the API.
-
-    Returns:
-        A list of extracted translations, with empty strings for unparseable entries.
-    """
     translations = []
     lines = response_text.splitlines()
     block = []
     for line in lines:
         if line.strip().startswith('- '):
             if block:
-                # Process the previous block
                 block_str = '\n'.join(block)
                 try:
                     data = yaml.safe_load(block_str)
@@ -63,7 +54,6 @@ def extract_partial_translations(response_text: str) -> list[str]:
         else:
             if block:
                 block.append(line)
-    # Process the last block
     if block:
         block_str = '\n'.join(block)
         try:
@@ -78,23 +68,11 @@ def extract_partial_translations(response_text: str) -> list[str]:
 
 
 def translate_batch(yaml_input: str, source_name: str = None, target_name: str = 'English') -> tuple[bool, str | None]:
-    """
-    Attempt to translate a batch of subtitles.
-
-    Args:
-        yaml_input: YAML formatted input string.
-        source_name: Source language name.
-        target_name: Target language name.
-
-    Returns:
-        Tuple (success, translated_yaml), where success is True if fully successful,
-        and translated_yaml is the response or None if the API call fails.
-    """
     client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
     prompt = (
         f"You will be given a YAML formatted subtitles containing entries with 'id' and 'text' fields. Here is the input:\n\n"
         f"<yaml>\n{yaml_input}\n</yaml>\n\n"
-        f"For each entry in the YAML, translate the contents of the 'text' field into {target_name}. "
+        f"For each entry in the YAML, translate the contents of the 'text' field from {source_name} into {target_name}. " if source_name is not None else f"For each entry in the YAML, translate the contents of the 'text' field into {target_name}. "
         f"Write the translation back into the 'translation_text' field for that entry.\n\n"
         f"Here is an example of the expected format:\n\n"
         f"<example>\n"
@@ -134,6 +112,36 @@ def translate_batch(yaml_input: str, source_name: str = None, target_name: str =
         return False, None
 
 
+def process_batch(batch_subs, source_name, target_name, max_retries=4):
+    batch_data = [{"id": j + 1, "text": sub.content}
+                  for j, sub in enumerate(batch_subs)]
+    yaml_input = yaml.dump(batch_data, allow_unicode=True)
+    translated_texts = []
+
+    for attempt in range(max_retries):
+        success, translated_yaml = translate_batch(
+            yaml_input, source_name, target_name)
+        if success:
+            translated_data = yaml.safe_load(translated_yaml)
+            translated_texts = [entry['translation_text']
+                                for entry in translated_data]
+            return True, translated_texts
+        else:
+            if attempt == max_retries - 1:
+                if translated_yaml:
+                    partial_translations = extract_partial_translations(
+                        translated_yaml)
+                    for j in range(len(batch_subs)):
+                        if j < len(partial_translations) and partial_translations[j]:
+                            translated_texts.append(partial_translations[j])
+                        else:
+                            translated_texts.append(batch_subs[j].content)
+                else:
+                    translated_texts = [sub.content for sub in batch_subs]
+                return False, translated_texts
+    return False, translated_texts
+
+
 def translate_srt(args):
     # Read SRT file
     try:
@@ -160,49 +168,43 @@ def translate_srt(args):
     total_subtitles = len(subs)
     optimal_batch_size = min(args.batch_size, max(
         1, math.ceil(total_subtitles / 10)))
+    # Adjust based on batches
+    max_workers = min(4, max(1, math.ceil(
+        total_subtitles / optimal_batch_size)))
 
-    translated_texts = []
-    max_retries = 4
+    translated_texts = [''] * total_subtitles
     consecutive_failures = 0
 
-    # Process batches
-    for i in tqdm(range(0, total_subtitles, optimal_batch_size), desc="Translating subtitles"):
-        batch_subs = subs[i:i + optimal_batch_size]
-        batch_data = [{"id": j + 1, "text": sub.content}
-                      for j, sub in enumerate(batch_subs)]
-        yaml_input = yaml.dump(batch_data, allow_unicode=True)
+    # Process batches concurrently
+    batches = [subs[i:i + optimal_batch_size]
+               for i in range(0, total_subtitles, optimal_batch_size)]
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_batch = {
+            executor.submit(process_batch, batch, source_name, target_name): (i, batch)
+            for i, batch in enumerate(batches)
+        }
 
-        for attempt in range(max_retries):
-            success, translated_yaml = translate_batch(
-                yaml_input, source_name, target_name)
-            if success:
-                translated_data = yaml.safe_load(translated_yaml)
-                translated_texts.extend(
-                    entry['translation_text'] for entry in translated_data)
-                consecutive_failures = 0
-                break
-            else:
-                if attempt == max_retries - 1:
-                    print(
-                        f"Batch failed after {max_retries} attempts. Extracting partial translations...")
-                    if translated_yaml:
-                        partial_translations = extract_partial_translations(
-                            translated_yaml)
-                        for j in range(len(batch_subs)):
-                            if j < len(partial_translations) and partial_translations[j]:
-                                translated_texts.append(
-                                    partial_translations[j])
-                            else:
-                                translated_texts.append(batch_subs[j].content)
-                    else:
-                        # API failure, no response available
-                        translated_texts.extend(
-                            sub.content for sub in batch_subs)
+        for future in tqdm(as_completed(future_to_batch), total=len(batches), desc="Translating subtitles", ncols=80):
+            batch_idx, batch = future_to_batch[future]
+            try:
+                success, batch_translations = future.result()
+                start_idx = batch_idx * optimal_batch_size
+                for j, text in enumerate(batch_translations):
+                    if start_idx + j < total_subtitles:
+                        translated_texts[start_idx + j] = text
+                if not success:
                     consecutive_failures += 1
                     if consecutive_failures >= 3:
-                        print(
-                            "Three consecutive batches failed. Stopping process.\ninput:\n{yaml_input}\noutput:\n{translated_yaml}")
+                        print("Three consecutive batches failed. Stopping process.")
                         return
+                else:
+                    consecutive_failures = 0
+            except Exception as e:
+                print(f"Error processing batch {batch_idx}: {e}")
+                consecutive_failures += 1
+                if consecutive_failures >= 3:
+                    print("Three consecutive batches failed. Stopping process.")
+                    return
 
     # Update subtitles with translations
     for sub, translated_text in zip(subs, translated_texts):
@@ -217,11 +219,9 @@ def translate_srt(args):
         print(f"Translation complete. Output saved to '{output_path}'.")
     except Exception as e:
         print(f"Error writing output file: {e}")
-        return
 
 
 def main():
-    # Parse command-line arguments
     parser = argparse.ArgumentParser(
         description="Translate SRT subtitles using OpenAI API.")
     parser.add_argument("input", help="Path to input SRT file")
