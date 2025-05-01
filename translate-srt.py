@@ -166,7 +166,7 @@ def translate_srt(args):
     consecutive_failures = 0
 
     # Process batches
-    for i in tqdm(range(0, total_subtitles, optimal_batch_size), desc="Translating subtitles"):
+    for i in tqdm(range(0, total_subtitles, optimal_batch_size), desc="Translating subtitles", ncols=80):
         batch_subs = subs[i:i + optimal_batch_size]
         batch_data = [{"id": j + 1, "text": sub.content}
                       for j, sub in enumerate(batch_subs)]
